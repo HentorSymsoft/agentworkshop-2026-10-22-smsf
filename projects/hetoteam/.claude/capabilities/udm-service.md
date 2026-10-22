@@ -4,7 +4,7 @@ type: capability
 domain: backend
 tools: Read, Write, Edit, Bash, Grep, Glob
 model: sonnet
-energy: 50
+energy: 70
 spawned: 2026-10-22
 can-merge-with: [nf-interop]
 ---
@@ -51,9 +51,10 @@ If you notice:
 
 This capability does NOT handle:
 - NRF registration/discovery and cross-team testing (nf-interop)
-- The colony tile UI
+- The colony tile UI and /metrics (udm-kpi-tile)
 - Anything in other teams' folders or shared files
 
 ## Evolution History
 
 - 2026-10-22: Spawned at awakening for the UDM module
+- 2026-10-22: Energy 50 → 70 after building the backend (PR 7)
