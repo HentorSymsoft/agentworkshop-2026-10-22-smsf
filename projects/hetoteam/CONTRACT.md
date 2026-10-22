@@ -37,6 +37,8 @@ The UDM holds subscriber data, stores which SMSF serves a UE, and answers the SM
 | imsi-001010000000005 | msisdn-46700000005 | `moSmsBarringAll: true` | MO SMS barred: SMSF must reject uplink SMS |
 | imsi-001019999999999 | msisdn-46799999999 | not provisioned | `404 USER_NOT_FOUND` / `UNKNOWN_SUBSCRIBER` |
 
+Any SUPI or GPSI not in the table is unknown, for example tompa's `imsi-001010000000099`.
+
 ---
 
 ## 1. Nudm_UECM — SMSF registration for 3GPP access (TS 29.503 §5.3)
@@ -180,8 +182,11 @@ Errors: `404 UNKNOWN_SUBSCRIBER`, `400 UNEXPECTED_DATA_VALUE`.
 ## 4. Alert-Service-Centre — UDM → SMSC (stretch goal)
 
 When an SMSF registers for a UE with MWD (section 1.1), the UDM sends one alert per stored SC address, then clears
-MWD. The UDM finds the SMSC through the NRF. **Path and NF type are to be agreed with @holminator.**
-Proposed body:
+MWD. Agreed with holminator in #build:
+
+- The UDM discovers the SMSC through the NRF with `target-nf-type=CUSTOM_SMSC` (service `nsmsc-sgd`).
+- `POST {smsc apiPrefix}/smsc/alert-service-centre`
+- holminator's SC address is `46700000100`.
 
 ```json
 { "msisdn": "46700000002", "scAddress": "46700000100", "alertReason": "UE_PRESENT" }
@@ -215,7 +220,8 @@ NRF tells it to. The NRF (smsf-hao) is found from the board, not hardcoded in ot
 }
 ```
 
-`sms-routing` is a workshop-only service name for section 3 (not in TS 29.510).
+`sms-routing` is a workshop-only service name for section 3 (not in TS 29.510). Every service has the same
+`apiPrefix`, so consumers that read `nfServices[0].apiPrefix` (as krilju does) get the right root.
 
 ---
 
