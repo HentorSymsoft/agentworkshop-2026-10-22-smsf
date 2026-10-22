@@ -83,6 +83,102 @@ function rec(entry) {
   if (log.length > LOG_MAX) log.shift();
 }
 
+// ---------- metrics (in memory, since plugin start) ----------
+
+const STARTED = Date.now();
+const ops = {};    // op -> { dir, total, ok, fail, msSum, msMax, lastStatus, lastTs, results: { cause: n } }
+const causes = {}; // cause/result -> n
+const recent = []; // timestamps of protocol messages, for the per-minute rate
+
+function opOf(dir, method, p) {
+  if (dir === 'in') {
+    if (p.startsWith('/nudm-uecm/')) return { PUT: 'uecm_register', GET: 'uecm_get', DELETE: 'uecm_deregister' }[method] || 'uecm_other';
+    if (p.startsWith('/nudm-sdm/')) return 'sdm_get';
+    if (p.endsWith('/send-routing-info-for-sm')) return 'sri_for_sm';
+    if (p.endsWith('/report-sm-delivery-status')) return 'report_sm_delivery_status';
+    return 'other_in';
+  }
+  if (p.includes('/nnrf-nfm/')) return { PUT: 'nrf_register', PATCH: 'nrf_heartbeat', DELETE: 'nrf_deregister' }[method] || 'nrf_other';
+  if (p.includes('/nnrf-disc/')) return 'nrf_discovery';
+  if (p.endsWith('/alert-service-centre')) return 'alert_service_centre';
+  return 'other_out';
+}
+
+function count(dir, method, p, status, ms, body) {
+  const op = opOf(dir, method, p);
+  const o = ops[op] || (ops[op] = { dir, total: 0, ok: 0, fail: 0, msSum: 0, msMax: 0, lastStatus: null, lastTs: null, results: {} });
+  const ok = status >= 200 && status < 300;
+  o.total++;
+  if (ok) o.ok++; else o.fail++;
+  o.msSum += ms;
+  o.msMax = Math.max(o.msMax, ms);
+  o.lastStatus = status;
+  o.lastTs = new Date().toISOString();
+  const result = ok ? String(status) : String((body && (body.cause || body.result)) || (status === 0 ? 'NO_ANSWER' : status));
+  o.results[result] = (o.results[result] || 0) + 1;
+  if (!ok) causes[result] = (causes[result] || 0) + 1;
+  const now = Date.now();
+  recent.push(now);
+  while (recent.length && now - recent[0] > 60000) recent.shift();
+}
+
+const rate = (a, b) => (b ? Math.round((a / b) * 1000) / 10 : null);
+
+function metrics() {
+  const now = Date.now();
+  while (recent.length && now - recent[0] > 60000) recent.shift();
+  const all = Object.values(ops);
+  const sum = (dir, k) => all.filter(o => o.dir === dir).reduce((a, o) => a + o[k], 0);
+  const op = n => ops[n] || { total: 0, ok: 0, fail: 0, results: {} };
+  const inTotal = sum('in', 'total');
+  const mwdPending = Object.values(mwd).reduce((a, m) => a + m.scAddresses.length, 0);
+  return {
+    uptimeSec: Math.round((now - STARTED) / 1000),
+    since: new Date(STARTED).toISOString(),
+    kpi: {
+      provisionedSubscribers: SUBSCRIBERS.length,
+      activeRegistrations: Object.keys(registrations).length,
+      mwdPending,
+      requestsIn: inTotal,
+      requestsOut: sum('out', 'total'),
+      errorRateInPct: rate(sum('in', 'fail'), inTotal),
+      avgLatencyInMs: inTotal ? Math.round((sum('in', 'msSum') / inTotal) * 10) / 10 : null,
+      messagesLastMinute: recent.length,
+      uecmRegisterSuccessPct: rate(op('uecm_register').ok, op('uecm_register').total),
+      sdmSuccessPct: rate(op('sdm_get').ok, op('sdm_get').total),
+      sriForSmSuccessPct: rate(op('sri_for_sm').ok, op('sri_for_sm').total),
+      sriAbsentSubscriber: op('sri_for_sm').results.ABSENT_SUBSCRIBER_SM || 0,
+      alertsSent: op('alert_service_centre').total,
+      alertsOk: op('alert_service_centre').ok,
+      nrfRegistered: nrf.registered,
+      nrfHeartbeatAgeSec: nrf.lastHeartbeat ? Math.round((now - nrf.lastHeartbeat) / 1000) : null,
+      nrfHeartbeatTimerSec: nrf.heartBeatTimer,
+    },
+    ops: Object.fromEntries(Object.entries(ops).map(([k, o]) => [k, {
+      dir: o.dir, total: o.total, ok: o.ok, fail: o.fail, successPct: rate(o.ok, o.total),
+      avgMs: o.total ? Math.round((o.msSum / o.total) * 10) / 10 : null, maxMs: o.msMax,
+      lastStatus: o.lastStatus, lastTs: o.lastTs, results: o.results,
+    }])),
+    causes,
+  };
+}
+
+// Same numbers in the Prometheus text format, for anyone who wants to scrape them.
+function prometheus(m) {
+  const lines = [];
+  const g = (name, help, v) => { if (v === null || v === undefined) return; lines.push(`# HELP udm_${name} ${help}`, `# TYPE udm_${name} gauge`, `udm_${name} ${typeof v === 'boolean' ? Number(v) : v}`); };
+  g('uptime_seconds', 'Seconds since the plugin started', m.uptimeSec);
+  g('registrations_active', 'Active SMSF registrations', m.kpi.activeRegistrations);
+  g('subscribers_provisioned', 'Provisioned subscribers', m.kpi.provisionedSubscribers);
+  g('mwd_pending', 'SC addresses waiting in Message Waiting Data', m.kpi.mwdPending);
+  g('nrf_registered', '1 when registered in the NRF', m.kpi.nrfRegistered);
+  lines.push('# HELP udm_messages_total Protocol messages by operation and result', '# TYPE udm_messages_total counter');
+  for (const [op, o] of Object.entries(m.ops)) {
+    for (const [result, n] of Object.entries(o.results)) lines.push(`udm_messages_total{op="${op}",dir="${o.dir}",result="${result}"} ${n}`);
+  }
+  return lines.join('\n') + '\n';
+}
+
 // ---------- HTTP helpers ----------
 
 function send(res, status, body, headers = {}) {
@@ -116,6 +212,7 @@ async function readJson(req) {
 
 async function call(peer, method, url, body, contentType = 'application/json') {
   const entry = { dir: 'out', peer, method, path: url, request: body };
+  const t0 = Date.now();
   try {
     const r = await fetch(url, {
       method,
@@ -126,10 +223,14 @@ async function call(peer, method, url, body, contentType = 'application/json') {
     const text = await r.text();
     let json = null;
     try { json = text ? JSON.parse(text) : null; } catch { json = text; }
-    rec({ ...entry, status: r.status, response: json });
+    const ms = Date.now() - t0;
+    rec({ ...entry, status: r.status, ms, response: json });
+    count('out', method, url, r.status, ms, json);
     return { status: r.status, body: json };
   } catch (e) {
-    rec({ ...entry, status: 0, response: e.message });
+    const ms = Date.now() - t0;
+    rec({ ...entry, status: 0, ms, response: e.message });
+    count('out', method, url, 0, ms, null);
     return { status: 0, body: null, error: e.message };
   }
 }
@@ -137,14 +238,19 @@ async function call(peer, method, url, body, contentType = 'application/json') {
 // ---------- NRF (TS 29.510) ----------
 
 function nfProfile() {
+  const self = new URL(SELF_BASE);
+  // TS 29.510: apiRoot = scheme://fqdn[:port]/apiPrefix. apiRoot itself is smsf-hao's convenience field.
   const svc = (id, name, v, full) => ({
     serviceInstanceId: id, serviceName: name, versions: [{ apiVersionInUri: v, apiFullVersion: full }],
-    scheme: 'https', nfServiceStatus: 'REGISTERED', apiPrefix: SELF_BASE,
+    scheme: self.protocol.replace(':', ''), nfServiceStatus: 'REGISTERED',
+    ...(self.port ? { ipEndPoints: [{ port: Number(self.port) }] } : {}),
+    apiPrefix: self.pathname, apiRoot: SELF_BASE,
   });
   return {
     nfInstanceId: NF_ID,
     nfType: 'UDM',
     nfStatus: 'REGISTERED',
+    fqdn: self.hostname,
     plmnList: [PLMN],
     udmInfo: {
       supiRanges: [{ start: '001010000000000', end: '001019999999999' }],
@@ -170,8 +276,8 @@ async function registerInNrf() {
 }
 
 async function heartbeat() {
-  const r = await call('nrf', 'PATCH', `${NRF_NFM}/nf-instances/${NF_ID}`,
-    [{ op: 'replace', path: '/nfStatus', value: 'REGISTERED' }], 'application/json-patch+json');
+  // An empty JSON Patch is the plain heartbeat (TS 29.510 5.2.2.3).
+  const r = await call('nrf', 'PATCH', `${NRF_NFM}/nf-instances/${NF_ID}`, [], 'application/json-patch+json');
   if (r.status === 404) { nrf.registered = false; return registerInNrf(); }
   if (r.status >= 200 && r.status < 300) { nrf.lastHeartbeat = Date.now(); nrf.lastError = null; }
   else nrf.lastError = `heartbeat answered ${r.status || r.error}`;
@@ -191,7 +297,15 @@ async function resolve(nfType) {
   const inst = r.body && Array.isArray(r.body.nfInstances) ? r.body.nfInstances[0] : null;
   if (!inst) return null;
   const svc = (inst.nfServices || [])[0] || {};
-  const base = (svc.apiPrefix || inst.apiPrefix || '').replace(/\/$/, '') || null;
+  // apiRoot (smsf-hao's field), then an absolute apiPrefix, then scheme://fqdn + apiPrefix.
+  let base = svc.apiRoot || inst.apiRoot || null;
+  const prefix = svc.apiPrefix || inst.apiPrefix || '';
+  if (!base && /^https?:\/\//.test(prefix)) base = prefix;
+  if (!base && inst.fqdn) {
+    const port = ((svc.ipEndPoints || [])[0] || {}).port;
+    base = `${svc.scheme || 'https'}://${inst.fqdn}${port ? `:${port}` : ''}${prefix}`;
+  }
+  base = base ? base.replace(/\/$/, '') : null;
   if (base) disc.set(nfType, { base, ts: Date.now() });
   return base;
 }
@@ -360,6 +474,15 @@ module.exports = {
       });
     }
     if (req.method === 'GET' && p === '/subscribers') return send(res, 200, SUBSCRIBERS);
+    if (req.method === 'GET' && p === '/metrics') {
+      const m = metrics();
+      if (url.searchParams.get('format') === 'prometheus') {
+        res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
+        res.end(prometheus(m));
+        return true;
+      }
+      return send(res, 200, m);
+    }
     if (req.method === 'GET' && p === '/registrations') return send(res, 200, { registrations, mwd });
     if (req.method === 'GET' && p === '/log') {
       const since = Number(url.searchParams.get('since')) || 0;
@@ -370,12 +493,15 @@ module.exports = {
       return send(res, 200, { reset: true });
     }
 
-    // Protocol messages: log each one with its answer.
+    // Protocol messages: log and count each one with its answer.
+    const t0 = Date.now();
     const origEnd = res.end.bind(res);
     res.end = (chunk, ...rest) => {
       let response = null;
       try { response = chunk && chunk.length ? JSON.parse(chunk.toString()) : null; } catch { response = String(chunk); }
-      rec({ dir: 'in', peer: peerOf(p), method: req.method, path: p + (url.search || ''), status: res.statusCode, request: bodies.get(req), response });
+      const ms = Date.now() - t0;
+      rec({ dir: 'in', peer: peerOf(p), method: req.method, path: p + (url.search || ''), status: res.statusCode, ms, request: bodies.get(req), response });
+      count('in', req.method, p, res.statusCode, ms, response);
       return origEnd(chunk, ...rest);
     };
     try {

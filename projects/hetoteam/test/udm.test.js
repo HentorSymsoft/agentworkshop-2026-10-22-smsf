@@ -32,11 +32,13 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname.startsWith('/t/fake-nrf/nnrf-nfm/v1/nf-instances/')) {
     nrfCalls.push({ method: req.method, body: body ? JSON.parse(body) : null, ct: req.headers['content-type'] });
     res.writeHead(req.method === 'PUT' ? 201 : 204, { 'content-type': 'application/json' });
-    return res.end(req.method === 'PUT' ? JSON.stringify({ ...JSON.parse(body), heartBeatTimer: 60 }) : '');
+    // heartBeatTimer 1 so the second NRF tick (13 s) sends a heartbeat during the test.
+    return res.end(req.method === 'PUT' ? JSON.stringify({ ...JSON.parse(body), heartBeatTimer: 1 }) : '');
   }
   if (url.pathname === '/t/fake-nrf/nnrf-disc/v1/nf-instances') {
     const t = url.searchParams.get('target-nf-type');
-    const inst = t === 'CUSTOM_SMSC' ? [{ nfType: t, nfServices: [{ apiPrefix: `${BASE}/t/fake-smsc` }] }] : [];
+    // Like smsf-hao's NRF: path-style apiPrefix plus a computed apiRoot.
+    const inst = t === 'CUSTOM_SMSC' ? [{ nfType: t, fqdn: 'elsewhere.invalid', nfServices: [{ scheme: 'http', apiPrefix: '/t/fake-smsc', apiRoot: `${BASE}/t/fake-smsc` }] }] : [];
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({ validityPeriod: 60, nfInstances: inst }));
   }
@@ -71,12 +73,13 @@ async function t(name, fn) {
   await new Promise(r => server.listen(PORT, '127.0.0.1', r));
   plugin.init({ dataDir });
 
-  await t('NRF registration with UDM profile and apiPrefix', async () => {
+  await t('NRF registration with UDM profile, fqdn, apiPrefix and apiRoot', async () => {
     await wait(3500);
     const put = nrfCalls.find(c => c.method === 'PUT');
     assert(put, 'no PUT to NRF');
     assert.strictEqual(put.body.nfType, 'UDM');
-    assert(put.body.nfServices.every(s => s.apiPrefix === `${BASE}/t/hetoteam`));
+    assert.strictEqual(put.body.fqdn, '127.0.0.1');
+    assert(put.body.nfServices.every(s => s.apiPrefix === '/t/hetoteam' && s.apiRoot === `${BASE}/t/hetoteam` && s.scheme === 'http'));
     assert.strictEqual((await req('GET', '/status')).body.nrf.registered, true);
   });
 
@@ -197,6 +200,40 @@ async function t(name, fn) {
   });
   await t('Unknown path → 404 from board', async () => {
     assert.strictEqual((await req('GET', '/nope')).status, 404);
+  });
+  await t('Log entries carry ms', async () => {
+    const l = (await req('GET', '/log')).body;
+    assert(l.filter(e => e.dir !== 'note').every(e => typeof e.ms === 'number'));
+  });
+  await t('GET /metrics: KPIs, ops and causes', async () => {
+    const m = (await req('GET', '/metrics')).body;
+    assert.strictEqual(m.kpi.provisionedSubscribers, 5);
+    assert.strictEqual(m.kpi.activeRegistrations, 1);
+    assert.strictEqual(m.kpi.nrfRegistered, true);
+    assert(m.ops.uecm_register.total >= 3 && m.ops.uecm_register.ok >= 2);
+    assert(m.ops.uecm_register.results.USER_NOT_FOUND >= 1);
+    assert(m.ops.sri_for_sm.results.ABSENT_SUBSCRIBER_SM >= 1);
+    assert.strictEqual(m.kpi.sriAbsentSubscriber, m.ops.sri_for_sm.results.ABSENT_SUBSCRIBER_SM);
+    assert(m.ops.alert_service_centre.ok >= 1 && m.kpi.alertsOk >= 1);
+    assert(m.ops.nrf_register.ok === 1 && m.ops.nrf_discovery.total >= 1);
+    assert(m.causes.USER_NOT_FOUND >= 1 && m.causes.CONTEXT_NOT_FOUND >= 1);
+    assert(m.kpi.requestsIn > 0 && m.kpi.errorRateInPct > 0 && m.kpi.messagesLastMinute > 0);
+    assert(!m.ops.other_in, '/metrics, /log etc. must not count as protocol traffic');
+  });
+  await t('GET /metrics?format=prometheus', async () => {
+    const r = await fetch(`${BASE}/t/hetoteam/metrics?format=prometheus`);
+    assert(r.headers.get('content-type').startsWith('text/plain'));
+    const text = await r.text();
+    assert(/^udm_registrations_active 1$/m.test(text));
+    assert(/^udm_messages_total\{op="uecm_register",dir="in",result="USER_NOT_FOUND"\} \d+$/m.test(text));
+  });
+  await t('NRF heartbeat is PATCH with an empty array', async () => {
+    for (let i = 0; i < 30 && !nrfCalls.some(c => c.method === 'PATCH'); i++) await wait(500);
+    const patch = nrfCalls.find(c => c.method === 'PATCH');
+    assert(patch, 'no heartbeat sent');
+    assert.deepStrictEqual(patch.body, []);
+    assert.strictEqual(patch.ct, 'application/json-patch+json');
+    assert.strictEqual((await req('GET', '/metrics')).body.ops.nrf_heartbeat.ok, 1);
   });
 
   console.log(`\n${passed} passed${process.exitCode ? ', some FAILED' : ''}`);
