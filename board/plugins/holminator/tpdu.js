@@ -123,25 +123,47 @@ function decodeSubmit(b) {
   const da = decTpAddr(b, 2);
   let i = da.next;
   const pid = b[i++], dcs = b[i++];
-  i += VP_LEN[(fo >> 3) & 3];
+  const vpf = (fo >> 3) & 3;
+  const validityMs = vpf === 2 ? relativeVpMs(b[i]) : null;
+  i += VP_LEN[vpf];
   const udl = b[i++];
   if (udl === undefined) throw new Error('truncated SMS-SUBMIT');
   return {
-    type: 'SMS-SUBMIT', mr, da: da.addr, pid, dcs,
-    srr: !!(fo & 0x20), udhi: !!(fo & 0x40), rd: !!(fo & 0x04),
+    type: 'SMS-SUBMIT', mr, da: da.addr, daToa: da.toa, pid, dcs, vpf, validityMs,
+    srr: !!(fo & 0x20), udhi: !!(fo & 0x40), rd: !!(fo & 0x04), rp: !!(fo & 0x80),
     text: decUd(b, i, dcs, udl, fo & 0x40),
   };
 }
 
-function encodeSubmit({ mr = 0, to, text, srr = false }) {
-  const u = encUd(text);
-  return [0x01 | (srr ? 0x20 : 0), mr & 0xff, ...encTpAddr(to), 0x00, u.dcs, u.udl, ...u.ud];
+// TS 23.040 9.2.3.12.1, relative TP-VP.
+function relativeVpMs(v) {
+  const MIN = 60000;
+  if (v <= 143) return (v + 1) * 5 * MIN;
+  if (v <= 167) return 12 * 60 * MIN + (v - 143) * 30 * MIN;
+  if (v <= 196) return (v - 166) * 24 * 60 * MIN;
+  return (v - 192) * 7 * 24 * 60 * MIN;
 }
 
-// MTI=00, TP-MMS=1 (no more messages), TP-SRI if a status report is wanted.
-function encodeDeliver({ from, text, sri = false, date }) {
+function encodeSubmit({ mr = 0, to, text, srr = false, rd = false, vp = null }) {
   const u = encUd(text);
-  return [0x04 | (sri ? 0x20 : 0), ...encTpAddr(from), 0x00, u.dcs, ...scts(date), u.udl, ...u.ud];
+  const fo = 0x01 | (srr ? 0x20 : 0) | (rd ? 0x04 : 0) | (vp === null ? 0 : 0x10);
+  return [fo, mr & 0xff, ...encTpAddr(to), 0x00, u.dcs, ...(vp === null ? [] : [vp & 0xff]), u.udl, ...u.ud];
+}
+
+// Semi-octet TP-SCTS / TP-DT back to an ISO time (TZ in quarter hours, sign in bit 3 of the 7th octet).
+function decScts(b, i) {
+  const d = k => (b[i + k] & 0x0f) * 10 + (b[i + k] >> 4);
+  const tzq = (b[i + 6] & 0x07) * 10 + (b[i + 6] >> 4);
+  const tzMin = ((b[i + 6] & 0x08) ? -1 : 1) * tzq * 15;
+  const utc = Date.UTC(2000 + d(0), d(1) - 1, d(2), d(3), d(4), d(5)) - tzMin * 60000;
+  return new Date(utc).toISOString();
+}
+
+// SMS-DELIVER, TS 23.040 9.2.2.1. TP-MMS is inverted: bit set = no more messages waiting in the SC.
+function encodeDeliver({ from, text, sri = false, date, moreToSend = false, rp = false, pid = 0 }) {
+  const u = encUd(text);
+  const fo = (moreToSend ? 0 : 0x04) | (sri ? 0x20 : 0) | (rp ? 0x80 : 0);
+  return [fo, ...encTpAddr(from), pid & 0xff, u.dcs, ...scts(date), u.udl, ...u.ud];
 }
 
 function decodeDeliver(b) {
@@ -150,13 +172,79 @@ function decodeDeliver(b) {
   const oa = decTpAddr(b, 1);
   let i = oa.next;
   const pid = b[i++], dcs = b[i++];
+  const sctsIso = decScts(b, i);
   i += 7;
   const udl = b[i++];
-  return { type: 'SMS-DELIVER', oa: oa.addr, pid, dcs, text: decUd(b, i, dcs, udl, fo & 0x40) };
+  if (udl === undefined) throw new Error('truncated SMS-DELIVER');
+  return {
+    type: 'SMS-DELIVER', oa: oa.addr, pid, dcs, scts: sctsIso,
+    moreToSend: !(fo & 0x04), sri: !!(fo & 0x20), rp: !!(fo & 0x80),
+    text: decUd(b, i, dcs, udl, fo & 0x40),
+  };
+}
+
+// SMS-STATUS-REPORT, TS 23.040 9.2.2.3: MTI=10, TP-SRQ=0 (result of an SMS-SUBMIT), MR and RA of the original
+// SUBMIT, its SC timestamp, the discharge time and TP-ST.
+function encodeStatusReport({ mr, ra, sctsDate, dtDate, st, moreToSend = false }) {
+  return [0x02 | (moreToSend ? 0 : 0x04), mr & 0xff, ...encTpAddr(ra), ...scts(sctsDate), ...scts(dtDate), st & 0xff];
+}
+
+function decodeStatusReport(b) {
+  const fo = b[0];
+  if ((fo & 3) !== 2) throw new Error('not an SMS-STATUS-REPORT');
+  const ra = decTpAddr(b, 2);
+  let i = ra.next;
+  if (b.length < i + 15) throw new Error('truncated SMS-STATUS-REPORT');
+  const out = { type: 'SMS-STATUS-REPORT', mr: b[1], ra: ra.addr, srq: !!(fo & 0x20), moreToSend: !(fo & 0x04) };
+  out.scts = decScts(b, i); i += 7;
+  out.dt = decScts(b, i); i += 7;
+  out.st = b[i];
+  return out;
+}
+
+// TP-ST values the SC uses (TS 23.040 9.2.3.15).
+const ST = {
+  RECEIVED_BY_SME: 0x00,
+  NO_RESPONSE_FROM_SME_TRYING: 0x22,
+  REMOTE_PROCEDURE_ERROR: 0x40,
+  INCOMPATIBLE_DESTINATION: 0x41,
+  NOT_OBTAINABLE: 0x43,
+  VALIDITY_PERIOD_EXPIRED: 0x46,
+  ERROR_IN_SME_STOPPED: 0x65,
+  SERVICE_REJECTED_STOPPED: 0x63,
+};
+
+// RP-ERROR (TS 24.011 7.3.4): MTI, ref, cause length, cause. Returns the RP-Cause or null for anything else.
+function rpErrorCause(hex) {
+  try {
+    const b = hexToBytes(hex);
+    if ((b[0] & 7) !== 4 && (b[0] & 7) !== 5) return null;
+    return b[2] >= 1 ? (b[3] & 0x7f) : null;
+  } catch { return null; }
 }
 
 // SMS-SUBMIT-REPORT for RP-ACK: MTI=01, TP-PI=0, TP-SCTS.
 const encodeSubmitReportAck = date => [0x01, 0x00, ...scts(date)];
+// SMS-SUBMIT-REPORT for RP-ERROR: MTI=01, TP-FCS, TP-PI=0, TP-SCTS.
+const encodeSubmitReportError = (fcs, date) => [0x01, fcs & 0xff, 0x00, ...scts(date)];
+
+// TP-FCS values (TS 23.040 9.2.3.22) the SC uses towards the originating UE.
+const FCS = {
+  TELEMATIC_INTERWORKING_NOT_SUPPORTED: 0x80,
+  CANNOT_REPLACE_SM: 0x81,
+  UNSPECIFIED_TP_PID_ERROR: 0x8f,
+  DATA_CODING_SCHEME_NOT_SUPPORTED: 0x90,
+  COMMAND_CANNOT_BE_ACTIONED: 0xa0,
+  SC_BUSY: 0xc0,
+  NO_SC_SUBSCRIPTION: 0xc1,
+  SC_SYSTEM_FAILURE: 0xc2,
+  INVALID_SME_ADDRESS: 0xc3,
+  DESTINATION_SME_BARRED: 0xc4,
+  SM_REJECTED_DUPLICATE_SM: 0xc5,
+  TP_VPF_NOT_SUPPORTED: 0xc6,
+  TP_VP_NOT_SUPPORTED: 0xc7,
+  UNSPECIFIED: 0xff,
+};
 
 // TS 24.011: RP-DATA MS->N has MTI 0, RP-DATA N->MS has MTI 1.
 function unwrapRp(b) {
@@ -171,6 +259,27 @@ function unwrapRp(b) {
 }
 function wrapRpDataToMs({ ref = 0, scAddress, tpdu }) {
   return [0x01, ref & 0xff, ...encRpAddr(scAddress), 0x00, tpdu.length, ...tpdu];
+}
+// RP-DATA MS->network (TS 24.011 7.3.1.2): empty RP-OA, RP-DA = SC address.
+function wrapRpDataToNetwork({ ref = 0, scAddress, tpdu }) {
+  return [0x00, ref & 0xff, 0x00, ...encRpAddr(scAddress), tpdu.length, ...tpdu];
+}
+const RP_MTI = ['RP-DATA (MS->N)', 'RP-DATA (N->MS)', 'RP-ACK (MS->N)', 'RP-ACK (N->MS)', 'RP-ERROR (MS->N)', 'RP-ERROR (N->MS)', 'RP-SMMA (MS->N)'];
+
+// Best-effort decoder for the test endpoint: any RP-DATA, SMS-SUBMIT or SMS-DELIVER we know.
+function decodeAny(hex) {
+  const b = hexToBytes(hex);
+  if (!b.length) throw new Error('empty payload');
+  const rp = (b[0] & 7) <= 1 ? unwrapRp(b) : null;
+  const t = rp ? rp.tpdu : b;
+  const rpInfo = rp ? { rpMessage: RP_MTI[rp.mti], rpRef: rp.ref, rpOa: rp.rpOa || null, rpDa: rp.rpDa || null } : null;
+  const mti = t[0] & 3;
+  const attempts = mti === 1 ? [decodeSubmit, decodeDeliver] : mti === 2 ? [decodeStatusReport] : [decodeDeliver, decodeSubmit];
+  let lastErr;
+  for (const f of attempts) {
+    try { return { rp: rpInfo, tpdu: { hex: bytesToHex(t), ...f(t) } }; } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('not a TPDU we know');
 }
 
 // The MO payload may be the bare SMS-SUBMIT (agreed) or a full RP-DATA (accepted).
@@ -187,6 +296,7 @@ function decodeMo(hex) {
 
 module.exports = {
   hexToBytes, bytesToHex, digitsOf,
-  decodeSubmit, encodeSubmit, encodeDeliver, decodeDeliver, encodeSubmitReportAck,
-  unwrapRp, wrapRpDataToMs, decodeMo,
+  decodeSubmit, encodeSubmit, encodeDeliver, decodeDeliver, encodeSubmitReportAck, encodeSubmitReportError, FCS,
+  encodeStatusReport, decodeStatusReport, ST, rpErrorCause,
+  unwrapRp, wrapRpDataToMs, wrapRpDataToNetwork, decodeMo, decodeAny,
 };

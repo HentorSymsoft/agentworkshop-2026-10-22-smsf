@@ -14,14 +14,35 @@ const PENDING_MT_MS = 15000;
 
 const contexts = new Map(); // supi -> { supi, gpsi, amfId, since }
 const pendingMt = new Map(); // smsRecordId -> resolve(report)
+const pendingMr = new Map(); // supi:rpMr -> smsRecordId, for UEs that omit smsRecordId in their RP-ACK
+let rpMrSeq = 0;
+const SC_ADDRESS = '46700000100';
+const rpLayer = require('./rp');
 const log = [];
 const disc = new Map(); // nfType -> { base, ts }
 let registered = false;
 
+const { AsyncLocalStorage } = require('async_hooks');
+const als = new AsyncLocalStorage(); // per-request { id, kind }, filled in once the SMS is identified
+const FLOW = Symbol('flow');
+const tag = (id, kind) => { const f = als.getStore(); if (f && id) { f.id = id; f.kind = kind; } };
+let logSeq = 0;
 function rec(dir, peer, what, data) {
-  log.push({ ts: new Date().toISOString(), dir, peer, what, data });
-  if (log.length > 300) log.shift();
+  log.push({ id: ++logSeq, ts: new Date().toISOString(), dir, peer, what, data, [FLOW]: als.getStore() });
+  if (log.length > 500) log.shift();
 }
+
+const startedAt = Date.now();
+const inbound = new Map();  // route -> { count, byStatus, ms }
+const outbound = new Map(); // peer  -> { count, errors, byStatus, ms }
+function bump(map, key, status, ms) {
+  const m = map.get(key) || { count: 0, errors: 0, byStatus: {}, ms: 0 };
+  m.count++; m.ms += ms;
+  if (status === 0 || status >= 400) m.errors++;
+  m.byStatus[status] = (m.byStatus[status] || 0) + 1;
+  map.set(key, m);
+}
+const table = map => Object.fromEntries([...map].map(([k, v]) => [k, { ...v, avgMs: v.count ? Math.round(v.ms / v.count) : 0 }]));
 
 function send(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
@@ -40,6 +61,13 @@ async function readJson(req) {
 
 async function call(peer, method, url, body) {
   rec('out', peer, `${method} ${url}`, body);
+  const t0 = Date.now();
+  const r = await rawCall(peer, method, url, body);
+  bump(outbound, peer, r.status, Date.now() - t0);
+  return r;
+}
+
+async function rawCall(peer, method, url, body) {
   try {
     const r = await fetch(url, {
       method,
@@ -153,33 +181,53 @@ async function uplinkSms(req, res, supi) {
   let b;
   try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
   rec('in', 'amf', `POST ue-contexts/${supi}/sendsms`, b);
+  tag((b.jsonData && b.jsonData.smsRecordId) || `mo-${supi.slice(-3)}-${Date.now()}`, 'MO'); // retagged MT if this is a UE answer
   const ctx = contexts.get(supi);
   if (!ctx) return problem(res, 404, 'CONTEXT_NOT_FOUND', 'SMS not activated for this supi');
   const jd = b.jsonData || {};
   const hex = jd.smsPayload && jd.smsPayload.hex;
   if (!hex) return problem(res, 400, 'MANDATORY_IE_MISSING', 'jsonData.smsPayload.hex missing');
+  const rp = rpLayer.parseFromUe(hex);
 
-  // The UE's answer to an MT SMS (RP-ACK / RP-ERROR) arrives here with the smsRecordId of the MT.
-  const waiting = jd.smsRecordId && pendingMt.get(jd.smsRecordId);
-  if (waiting) {
-    pendingMt.delete(jd.smsRecordId);
-    waiting({ hex, error: (parseInt(hex.slice(0, 2), 16) & 7) === 4 });
-    return send(res, 200, { smsRecordId: jd.smsRecordId, deliveryStatus: 'SMS_DELIVERY_SUCCESS' });
+  // The UE's answer to an MT SMS (RP-ACK / RP-ERROR) arrives here, matched on smsRecordId or on the RP-MR.
+  if (rp && (rp.type === 'ACK' || rp.type === 'ERROR')) {
+    const id = (jd.smsRecordId && pendingMt.has(jd.smsRecordId) && jd.smsRecordId) || pendingMr.get(`${supi}:${rp.rpMr}`);
+    tag(id, 'MT');
+    const waiting = id && pendingMt.get(id);
+    if (waiting) {
+      pendingMt.delete(id);
+      waiting({ hex: rp.tpdu, error: rp.type === 'ERROR', cause: rp.cause });
+      return send(res, 200, { smsRecordId: id, deliveryStatus: 'SMS_DELIVERY_SUCCESS' });
+    }
+    return problem(res, 404, 'NO_PENDING_MT', 'no MT SMS is waiting for this report');
   }
 
   const mng = ctx.mng || {};
   if (mng.moSmsSubscribed === false || mng.moSmsBarringAll === true) {
     return problem(res, 403, 'MO_SMS_BARRED', 'MO SMS is not allowed for this subscriber');
   }
+  // RP-DATA from the UE: the SMSC leg carries the bare TPDU. Anything else is passed on as is.
+  const isRpData = rp && rp.type === 'DATA';
+  const tpdu = isRpData ? rp.tpdu : hex;
   const smsc = await resolve('SMSC');
   if (!smsc) return problem(res, 503, 'NF_DISCOVERY_FAILED', 'no SMSC found in NRF');
-  const r = await call('smsc', 'POST', `${smsc}/smsc/mo-forward-short-message`,
-    { supi, msisdn: ctx.gpsi, sms: { hex }, smsRecordId: jd.smsRecordId });
+  const r = await call('smsc', 'POST', `${smsc}/smsc/mo-forward-short-message`, {
+    supi, msisdn: ctx.gpsi, scAddress: (isRpData && rp.scAddress) || SC_ADDRESS, sms: { hex: tpdu }, smsRecordId: jd.smsRecordId,
+  });
+  const report = r.body && r.body.deliveryReport && r.body.deliveryReport.hex;
+  const payload = hexStr => ({ contentType: 'application/vnd.3gpp.sms', hex: hexStr });
   if (r.status === 200 && r.body && r.body.result === 'SUCCESS') {
-    return send(res, 200, { smsRecordId: jd.smsRecordId, deliveryStatus: 'SMS_DELIVERY_SUCCESS', deliveryReport: r.body.deliveryReport });
+    return send(res, 200, {
+      smsRecordId: jd.smsRecordId, deliveryStatus: 'SMS_DELIVERY_SUCCESS', deliveryReport: r.body.deliveryReport,
+      ...(isRpData ? { smsPayload: payload(rpLayer.rpAck(rp.rpMr, report)) } : {}),
+    });
   }
   const cause = (r.body && r.body.result) || 'SMSC_FAILURE';
-  return problem(res, r.status === 0 ? 504 : 502, cause, `SMSC answered ${r.status}`);
+  const status = r.status === 0 ? 504 : 502;
+  const err = { status, cause, detail: `SMSC answered ${r.status}` };
+  // Give the UE an RP-ERROR: 21 short message transfer rejected, 38 network out of order.
+  if (isRpData) err.smsPayload = payload(rpLayer.rpError(rp.rpMr, r.status === 403 ? 21 : 38, report));
+  return send(res, status, err);
 }
 
 async function mtForward(req, res) {
@@ -187,33 +235,71 @@ async function mtForward(req, res) {
   try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
   rec('in', 'smsc', 'POST /smsc/mt-forward-short-message', b);
   const hex = b.sms && b.sms.hex;
+  const id = b.smsRecordId || `mt-${Date.now()}`;
+  tag(id, 'MT');
   if (!hex || !(b.supi || b.msisdn)) return send(res, 400, { result: 'FAILURE', cause: 'supi or msisdn and sms.hex are required' });
   let ctx = b.supi ? contexts.get(b.supi) : null;
   if (!ctx && b.msisdn) ctx = [...contexts.values()].find(c => c.gpsi && c.gpsi.replace(/^msisdn-/, '') === String(b.msisdn).replace(/^msisdn-/, ''));
   if (!ctx) return send(res, 404, { result: 'UNKNOWN_SUBSCRIBER', cause: 'no SMS context in this SMSF' });
   const amf = await resolve('AMF');
   if (!amf) return send(res, 503, { result: 'FAILURE', cause: 'no AMF found in NRF' });
-  const id = b.smsRecordId || `mt-${Date.now()}`;
+  const rpMr = (rpMrSeq = (rpMrSeq + 1) & 0xff);
+  const mrKey = `${ctx.supi}:${rpMr}`;
   // Register before the call: the UE's RP-ACK may arrive before the N1N2 answer returns.
   const report = new Promise(resolve => {
     pendingMt.set(id, resolve);
+    pendingMr.set(mrKey, id);
     const t = setTimeout(() => { if (pendingMt.delete(id)) resolve(null); }, PENDING_MT_MS);
     if (t.unref) t.unref();
   });
+  report.then(() => pendingMr.delete(mrKey));
   const r = await call('amf', 'POST', `${amf}/namf-comm/v1/ue-contexts/${ctx.supi}/n1-n2-messages`, {
     n1MessageContainer: { n1MessageClass: 'SMS', n1MessageContent: { contentId: 'sms' } },
-    smsPayload: { contentType: 'application/vnd.3gpp.sms', hex },
+    smsPayload: { contentType: 'application/vnd.3gpp.sms', hex: rpLayer.rpDataToUe(rpMr, b.scAddress || SC_ADDRESS, hex) },
     smsRecordId: id,
   });
   if (r.status < 200 || r.status >= 300) {
     pendingMt.delete(id);
+    pendingMr.delete(mrKey);
     if (r.status === 404 || r.status === 504 || r.status === 0) return send(res, 504, { result: 'ABSENT_SUBSCRIBER', cause: 'UE not reachable' });
     return send(res, 502, { result: 'FAILURE', cause: `AMF answered ${r.status}` });
   }
   const rep = await report;
   if (!rep) return send(res, 504, { result: 'FAILURE', cause: 'no delivery report from the UE' });
-  if (rep.error) return send(res, 502, { result: 'FAILURE', cause: 'UE answered RP-ERROR', deliveryReport: { hex: rep.hex } });
-  return send(res, 200, { result: 'SUCCESS', deliveryReport: { hex: rep.hex } });
+  if (rep.error) return send(res, 502, { result: 'FAILURE', cause: 'UE answered RP-ERROR', rpCause: rep.cause, ...(rep.hex ? { deliveryReport: { hex: rep.hex } } : {}) });
+  return send(res, 200, { result: 'SUCCESS', ...(rep.hex ? { deliveryReport: { hex: rep.hex } } : {}) });
+}
+
+function routeOf(method, path) {
+  if (/^\/nsmsf-sms\/v2\/ue-contexts\/[^/]+\/sendsms$/.test(path) && method === 'POST') return { name: 'UplinkSMS', peer: 'amf' };
+  if (/^\/nsmsf-sms\/v2\/ue-contexts\/[^/]+$/.test(path) && method === 'PUT') return { name: 'Activate', peer: 'amf' };
+  if (/^\/nsmsf-sms\/v2\/ue-contexts\/[^/]+$/.test(path) && method === 'DELETE') return { name: 'Deactivate', peer: 'amf' };
+  if (method === 'POST' && path === '/smsc/mt-forward-short-message') return { name: 'MT-Forward-Short-Message', peer: 'smsc' };
+  return null;
+}
+
+function prometheus() {
+  const out = [`smsf_uptime_seconds ${Math.round((Date.now() - startedAt) / 1000)}`,
+    `smsf_ue_contexts ${contexts.size}`, `smsf_registered_in_nrf ${registered ? 1 : 0}`, `smsf_pending_mt ${pendingMt.size}`];
+  for (const [k, v] of inbound) for (const [st, n] of Object.entries(v.byStatus)) out.push(`smsf_inbound_total{route="${k}",status="${st}"} ${n}`);
+  for (const [k, v] of outbound) for (const [st, n] of Object.entries(v.byStatus)) out.push(`smsf_outbound_total{peer="${k}",status="${st}"} ${n}`);
+  return out.join('\n') + '\n';
+}
+
+function routeOf(method, path) {
+  if (/^\/nsmsf-sms\/v2\/ue-contexts\/[^/]+\/sendsms$/.test(path) && method === 'POST') return { name: 'UplinkSMS', peer: 'amf' };
+  if (/^\/nsmsf-sms\/v2\/ue-contexts\/[^/]+$/.test(path) && method === 'PUT') return { name: 'Activate', peer: 'amf' };
+  if (/^\/nsmsf-sms\/v2\/ue-contexts\/[^/]+$/.test(path) && method === 'DELETE') return { name: 'Deactivate', peer: 'amf' };
+  if (method === 'POST' && path === '/smsc/mt-forward-short-message') return { name: 'MT-Forward-Short-Message', peer: 'smsc' };
+  return null;
+}
+
+function prometheus() {
+  const out = [`smsf_uptime_seconds ${Math.round((Date.now() - startedAt) / 1000)}`,
+    `smsf_ue_contexts ${contexts.size}`, `smsf_registered_in_nrf ${registered ? 1 : 0}`, `smsf_pending_mt ${pendingMt.size}`];
+  for (const [k, v] of inbound) for (const [st, n] of Object.entries(v.byStatus)) out.push(`smsf_inbound_total{route="${k}",status="${st}"} ${n}`);
+  for (const [k, v] of outbound) for (const [st, n] of Object.entries(v.byStatus)) out.push(`smsf_outbound_total{peer="${k}",status="${st}"} ${n}`);
+  return out.join('\n') + '\n';
 }
 
 module.exports = {
@@ -230,7 +316,20 @@ module.exports = {
     if (first.unref) first.unref();
   },
 
-  async handle(req, res, { path }) {
+  handle(req, res, ctx) {
+    return als.run({}, () => handleInner(req, res, ctx));
+  },
+};
+
+async function handleInner(req, res, { path }) {
+    const route = routeOf(req.method, path);
+    if (route) {
+      const t0 = Date.now();
+      res.on('finish', () => {
+        bump(inbound, route.name, res.statusCode, Date.now() - t0);
+        rec('out', route.peer, `${res.statusCode} ${route.name}`);
+      });
+    }
     const m = path.match(/^\/nsmsf-sms\/v2\/ue-contexts\/([^/]+)(\/sendsms)?$/);
     if (m) {
       const supi = decodeURIComponent(m[1]);
@@ -240,9 +339,22 @@ module.exports = {
       return problem(res, 405, 'METHOD_NOT_ALLOWED', 'see CONTRACT.md');
     }
     if (req.method === 'POST' && path === '/smsc/mt-forward-short-message') return mtForward(req, res);
-    if (req.method === 'GET' && path === '/log') return send(res, 200, log.slice(-100));
+    if (req.method === 'GET' && path === '/log') {
+      const lim = Math.min(500, Number(new URL(req.url, 'http://x').searchParams.get('limit')) || 100);
+      return send(res, 200, log.slice(-lim).map(e => ({ ...e, flow: e[FLOW] && e[FLOW].id, kind: e[FLOW] && e[FLOW].kind })));
+    }
+    if (req.method === 'GET' && path === '/metrics') {
+      return send(res, 200, {
+        uptimeSeconds: Math.round((Date.now() - startedAt) / 1000), nfInstanceId: NF_ID, registeredInNrf: registered,
+        ueContexts: contexts.size, pendingMt: pendingMt.size, inbound: table(inbound), outbound: table(outbound),
+      });
+    }
+    if (req.method === 'GET' && path === '/metrics.prom') {
+      res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4' });
+      res.end(prometheus());
+      return true;
+    }
     if (req.method === 'GET' && path === '/contexts') return send(res, 200, [...contexts.values()]);
     if (req.method === 'GET' && path === '/status') return send(res, 200, { nfInstanceId: NF_ID, registeredInNrf: registered, contexts: contexts.size });
     return false;
-  },
-};
+}
