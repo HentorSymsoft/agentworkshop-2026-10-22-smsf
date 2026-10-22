@@ -201,7 +201,7 @@ NRF tells it to. The NRF (smsf-hao) is found from the board, not hardcoded in ot
 
 ```json
 {
-  "nfInstanceId": "<uuid, stable across restarts>",
+  "nfInstanceId": "a1b2c3d4-0000-4000-8000-000068657465",
   "nfType": "UDM",
   "nfStatus": "REGISTERED",
   "plmnList": [{ "mcc": "001", "mnc": "01" }],
@@ -229,9 +229,13 @@ NRF tells it to. The NRF (smsf-hao) is found from the board, not hardcoded in ot
 
 | Method and path | What |
 | --- | --- |
+| `GET /t/hetoteam/status` | NF instance id, NRF registration state, counts |
 | `GET /t/hetoteam/subscribers` | All provisioned subscribers and their SMS data |
 | `GET /t/hetoteam/registrations` | Current SMSF registrations and MWD lists |
 | `GET /t/hetoteam/log?since=<n>` | Incoming and outgoing messages, newest last: `{ id, ts, dir, peer, method, path, status, body }` |
 | `POST /t/hetoteam/admin/reset` | Clear registrations and MWD (subscribers stay) |
 
-Tile with the live message log: `https://smsf.torget.bjarby.com/colony/hetoteam/`.
+Tile with the live message log (planned): `https://smsf.torget.bjarby.com/colony/hetoteam/`.
+
+Implementation: `board/plugins/hetoteam/index.js`. Local test with a fake NRF and SMSC, from the repo root:
+`node projects/hetoteam/test/udm.test.js`.

@@ -1,1 +1,3 @@
 # HIVE Evolution Log
+2026-10-22 10:10 SPAWN: udm-service (backend for Nudm_UECM, Nudm_SDM and SMSC routing per our CONTRACT.md)
+2026-10-22 10:10 SPAWN: nf-interop (NRF registration, contract alignment and cross-team tests with SMSF, SMSC, AMF, NRF)
